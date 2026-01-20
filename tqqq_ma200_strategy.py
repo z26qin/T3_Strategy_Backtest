@@ -2,7 +2,7 @@
 TQQQ MA200 Backtesting Strategy
 
 Strategy Rules:
-- BUY TQQQ when: QQQ > MA200 * 1.04 AND QQQ daily loss >= 1%
+- BUY TQQQ when: QQQ > MA200 * 1.04 AND QQQ drops >= 1% intraday (Low vs prev Close)
 - SELL when: QQQ < MA200 * 0.97
 """
 
@@ -57,12 +57,13 @@ class TQQQ_MA200_Strategy:
         print(f"TQQQ data shape: {self.tqqq_data.shape}")
 
     def calculate_indicators(self):
-        """Calculate MA200 and daily returns for QQQ."""
+        """Calculate MA200 and intraday drop for QQQ."""
         # Calculate 200-day moving average
         self.qqq_data['MA200'] = self.qqq_data['Close'].rolling(window=self.ma_period).mean()
 
-        # Calculate daily returns
-        self.qqq_data['Daily_Return'] = self.qqq_data['Close'].pct_change()
+        # Calculate intraday drop: (Low - Previous Close) / Previous Close
+        self.qqq_data['Prev_Close'] = self.qqq_data['Close'].shift(1)
+        self.qqq_data['Intraday_Drop'] = (self.qqq_data['Low'] - self.qqq_data['Prev_Close']) / self.qqq_data['Prev_Close']
 
         # Calculate thresholds
         self.qqq_data['Buy_Level'] = self.qqq_data['MA200'] * self.buy_threshold
@@ -82,16 +83,17 @@ class TQQQ_MA200_Strategy:
         # Initialize signals DataFrame
         self.signals = pd.DataFrame(index=self.qqq_data.index)
         self.signals['QQQ_Close'] = self.qqq_data['Close']
+        self.signals['QQQ_Low'] = self.qqq_data['Low']
         self.signals['TQQQ_Close'] = self.tqqq_data['Close']
         self.signals['MA200'] = self.qqq_data['MA200']
-        self.signals['Daily_Return'] = self.qqq_data['Daily_Return']
+        self.signals['Intraday_Drop'] = self.qqq_data['Intraday_Drop']
         self.signals['Buy_Level'] = self.qqq_data['Buy_Level']
         self.signals['Sell_Level'] = self.qqq_data['Sell_Level']
 
-        # Buy condition: QQQ > MA200 * 1.04 AND daily loss >= 1%
+        # Buy condition: QQQ > MA200 * 1.04 AND intraday drop >= 1%
         self.signals['Buy_Condition'] = (
             (self.signals['QQQ_Close'] > self.signals['Buy_Level']) &
-            (self.signals['Daily_Return'] <= self.daily_loss_threshold)
+            (self.signals['Intraday_Drop'] <= self.daily_loss_threshold)
         )
 
         # Sell condition: QQQ < MA200 * 0.97
@@ -202,9 +204,10 @@ class TQQQ_MA200_Strategy:
                 'Date': date,
                 'Action': action,
                 'QQQ_Price': round(row['QQQ_Close'], 2),
+                'QQQ_Low': round(row['QQQ_Low'], 2),
                 'TQQQ_Price': round(row['TQQQ_Close'], 2),
                 'MA200': round(row['MA200'], 2),
-                'QQQ_Daily_Return': f"{row['Daily_Return']*100:.2f}%"
+                'Intraday_Drop': f"{row['Intraday_Drop']*100:.2f}%"
             })
 
         return pd.DataFrame(trade_log)
@@ -271,7 +274,7 @@ class TQQQ_MA200_Strategy:
         print("TQQQ MA200 Strategy Backtest")
         print("=" * 60)
         print(f"\nStrategy Rules:")
-        print(f"  BUY TQQQ when: QQQ > MA200 × {self.buy_threshold} AND QQQ daily loss >= 1%")
+        print(f"  BUY TQQQ when: QQQ > MA200 × {self.buy_threshold} AND QQQ intraday drop >= 1%")
         print(f"  SELL when: QQQ < MA200 × {self.sell_threshold}")
         print(f"\nBacktest Period: {self.start_date} to {self.end_date}")
         print(f"Initial Capital: ${self.initial_capital:,.2f}")
