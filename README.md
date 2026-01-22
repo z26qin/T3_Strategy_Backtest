@@ -30,7 +30,10 @@ T3_Strategy_Backtest/
 │   ├── tqqq_ma200_strategy.py      # Core backtesting engine
 │   ├── signal_checker.py           # Daily signal checker
 │   ├── leveraged_etf_comparison.py # Compare multiple ETFs
-│   └── liquidity_analysis.py       # Market liquidity analysis
+│   ├── liquidity_analysis.py       # Market liquidity analysis
+│   ├── alerts.py                   # Email/Discord alerts
+│   ├── position_sizing.py          # Kelly, volatility-adjusted sizing
+│   └── optimizer.py                # Grid search & walk-forward optimization
 ├── tqqq_ma200_strategy_notebook.ipynb      # Backtest notebook
 ├── tqqq_signal_checker.ipynb               # Daily signal notebook
 ├── leveraged_etf_comparison_notebook.ipynb # ETF comparison notebook
@@ -112,7 +115,7 @@ print(f"Sharpe Ratio: {results['metrics']['strategy']['sharpe']:.2f}")
 
 ## Dashboard Features
 
-The web dashboard has 4 tabs:
+The web dashboard has 6 tabs:
 
 ### 1. Daily Signal
 
@@ -134,7 +137,25 @@ Run backtests with customizable parameters.
 - Portfolio value chart (log scale)
 - Drawdown chart
 
-### 3. ETF Comparison
+### 3. Position Sizing (NEW)
+
+Advanced backtesting with dynamic position sizing.
+
+- **Full Position**: 100% in or out
+- **Kelly Criterion**: Optimal sizing based on win rate and win/loss ratio
+- **Volatility-Adjusted**: Size inversely proportional to volatility, with VIX adjustment
+- **Scale In/Out**: Gradually build position as price drops from entry
+
+### 4. Optimization (NEW)
+
+Find optimal strategy parameters.
+
+- **Grid Search**: Test all parameter combinations
+- **Walk-Forward**: Train on historical data, test on out-of-sample (prevents overfitting)
+- Heatmaps showing Sharpe ratio by parameters
+- Performance degradation analysis
+
+### 5. ETF Comparison
 
 Compare different ETFs using the same QQQ-based signals.
 
@@ -144,7 +165,7 @@ Compare different ETFs using the same QQQ-based signals.
 - Strategy performance chart
 - Buy & Hold comparison chart
 
-### 4. Liquidity Analysis
+### 6. Liquidity Analysis
 
 Monitor US market liquidity conditions.
 
@@ -220,6 +241,149 @@ Comprehensive liquidity analysis with 95% confidence intervals using:
 - Parametric confidence intervals (t-distribution)
 - Bootstrap confidence intervals (10,000 iterations)
 - Rolling confidence intervals
+
+## Automated Alerts
+
+Get notified when BUY/SELL signals trigger via Email or Discord.
+
+### Setup
+
+1. **Email (Gmail)**:
+   ```bash
+   export ALERT_EMAIL_ENABLED=true
+   export ALERT_EMAIL_SENDER=your.email@gmail.com
+   export ALERT_EMAIL_PASSWORD=your_app_password  # Use App Password, not regular password
+   # Default recipient: z26qin@uwaterloo.ca
+   ```
+
+2. **Discord**:
+   ```bash
+   # Create webhook in Server Settings > Integrations > Webhooks
+   export ALERT_DISCORD_ENABLED=true
+   export ALERT_DISCORD_WEBHOOK_URL=your_webhook_url
+   ```
+
+### Usage
+
+```python
+from strategies import AlertManager, load_config_from_env, SignalChecker
+
+# Load config from environment
+config = load_config_from_env()
+alerts = AlertManager(config)
+
+# Check signal and send alert
+checker = SignalChecker()
+summary = checker.get_summary_dict()
+
+if summary['signal'] in ['BUY', 'SELL']:
+    alerts.send_alert(summary['signal'], summary)
+```
+
+## Position Sizing Methods
+
+### Kelly Criterion
+
+Optimal position sizing based on historical performance:
+
+```
+Kelly % = W - [(1-W) / R]
+```
+Where W = win rate, R = average win / average loss
+
+Recommended: Use half-Kelly (0.5 fraction) for safety.
+
+### Volatility-Adjusted
+
+Position size inversely proportional to current volatility:
+
+```
+Position Size = Target Vol / Current Vol
+```
+
+Also adjusts based on VIX levels:
+- VIX < 15: Full position
+- VIX > 30: 25% position
+- Linear interpolation between
+
+### Scale In/Out
+
+Gradually build position as price drops from entry:
+- Level 1: 33% at entry
+- Level 2: 66% after 2% drop
+- Level 3: 100% after 4% drop
+
+## AWS Deployment
+
+### Option 1: EC2 (Recommended for Always-On)
+
+**Instance**: t3.micro (free tier eligible for 12 months)
+
+| Component | Cost/Month |
+|-----------|------------|
+| t3.micro instance | $0 (free tier) or ~$8.50 |
+| EBS storage (8GB) | ~$0.80 |
+| Data transfer | ~$0-1 |
+| **Total** | **$0-10/month** |
+
+**Setup**:
+```bash
+# SSH into EC2
+ssh -i your-key.pem ec2-user@your-ec2-ip
+
+# Install dependencies
+sudo yum update -y
+sudo yum install python3 python3-pip git -y
+
+# Clone and setup
+git clone https://github.com/z26qin/T3_Strategy_Backtest.git
+cd T3_Strategy_Backtest
+pip3 install -r requirements.txt
+
+# Run with screen (keeps running after disconnect)
+screen -S dashboard
+python3 app.py --host 0.0.0.0
+# Ctrl+A, D to detach
+```
+
+### Option 2: AWS Lambda + EventBridge (Cheapest for Daily Alerts)
+
+For daily signal checking and alerts only (no dashboard):
+
+| Component | Cost/Month |
+|-----------|------------|
+| Lambda (1 run/day) | ~$0.01 |
+| EventBridge | Free |
+| **Total** | **~$0.01/month** |
+
+### Option 3: AWS Lightsail (Simplest)
+
+**Instance**: $3.50/month (512MB RAM, 1 vCPU)
+
+| Component | Cost/Month |
+|-----------|------------|
+| Lightsail instance | $3.50 |
+| Static IP | Free |
+| **Total** | **$3.50/month** |
+
+### Option 4: ECS Fargate (Scalable)
+
+For production deployments with auto-scaling:
+
+| Component | Cost/Month |
+|-----------|------------|
+| Fargate (0.25 vCPU, 0.5GB) | ~$9 |
+| Load Balancer | ~$16 |
+| **Total** | **~$25/month** |
+
+### Recommendation
+
+| Use Case | Best Option | Cost |
+|----------|-------------|------|
+| Personal daily monitoring | EC2 t3.micro | $0-10/mo |
+| Alerts only (no dashboard) | Lambda | $0.01/mo |
+| Simple always-on | Lightsail | $3.50/mo |
+| Production/scaling | ECS Fargate | $25+/mo |
 
 ## License
 
