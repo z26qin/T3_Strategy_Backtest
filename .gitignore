@@ -12,6 +12,9 @@ env/
 # Data
 *.csv
 
+# Verification cache
+cache/
+
 # OS
 .DS_Store
 
