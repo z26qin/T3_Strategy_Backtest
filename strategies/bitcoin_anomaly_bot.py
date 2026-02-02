@@ -89,9 +89,14 @@ class BotConfig:
     volume_zscore_threshold: float = 3.0
     volatility_zscore_threshold: float = 2.5
 
-    # Percentage thresholds
-    price_change_threshold_pct: float = 5.0  # 5% in 1 hour
-    volume_spike_multiplier: float = 3.0  # 3x average volume
+    # Percentage thresholds (24-hour)
+    price_change_threshold_24h_pct: float = 5.0  # 5% in 24 hours
+    volume_spike_multiplier_24h: float = 3.0  # 3x average 24h volume
+
+    # Percentage thresholds (7-day)
+    price_change_threshold_7d_pct: float = 15.0  # 15% in 7 days
+    volume_spike_multiplier_7d: float = 2.0  # 2x average 7d volume
+    volatility_zscore_threshold_7d: float = 2.0  # Lower threshold for 7d
 
     # Bollinger Bands
     bollinger_period: int = 20
@@ -290,7 +295,7 @@ class AnomalyDetector:
         return lower, middle, upper
 
     def detect_price_anomalies(self, df: pd.DataFrame) -> List[AnomalyEvent]:
-        """Detect price-related anomalies."""
+        """Detect price-related anomalies for both 24h and 7d timeframes."""
         anomalies = []
 
         if df.empty or 'close' not in df.columns:
@@ -299,7 +304,7 @@ class AnomalyDetector:
         prices = df['close']
         current_price = prices.iloc[-1]
 
-        # Z-score based detection
+        # Z-score based detection (full period)
         z_score = self.calculate_z_score(prices[:-1], current_price)
 
         if abs(z_score) > self.config.price_zscore_threshold:
@@ -315,26 +320,47 @@ class AnomalyDetector:
                 current_value=current_price,
                 threshold_value=prices.mean(),
                 z_score=z_score,
-                metadata={"mean_price": prices.mean(), "std_dev": prices.std()}
+                metadata={"mean_price": prices.mean(), "std_dev": prices.std(), "timeframe": "full"}
             ))
 
-        # Percentage change detection (last hour)
-        if len(prices) >= 2:
-            hourly_change_pct = ((current_price - prices.iloc[-2]) / prices.iloc[-2]) * 100
+        # 24-hour percentage change detection
+        if len(prices) >= 24:
+            price_24h_ago = prices.iloc[-24]
+            change_24h_pct = ((current_price - price_24h_ago) / price_24h_ago) * 100
 
-            if abs(hourly_change_pct) > self.config.price_change_threshold_pct:
-                severity = AlertSeverity.CRITICAL if abs(hourly_change_pct) > 10 else AlertSeverity.HIGH
-                anomaly_type = AnomalyType.PRICE_SPIKE if hourly_change_pct > 0 else AnomalyType.PRICE_DROP
+            if abs(change_24h_pct) > self.config.price_change_threshold_24h_pct:
+                severity = AlertSeverity.CRITICAL if abs(change_24h_pct) > 10 else AlertSeverity.HIGH
+                anomaly_type = AnomalyType.PRICE_SPIKE if change_24h_pct > 0 else AnomalyType.PRICE_DROP
 
                 anomalies.append(AnomalyEvent(
                     timestamp=datetime.now(),
                     anomaly_type=anomaly_type,
                     severity=severity,
-                    description=f"Bitcoin {'surged' if hourly_change_pct > 0 else 'dropped'} "
-                               f"{abs(hourly_change_pct):.2f}% in the last period",
+                    description=f"Bitcoin {'surged' if change_24h_pct > 0 else 'dropped'} "
+                               f"{abs(change_24h_pct):.2f}% in the last 24 hours",
                     current_value=current_price,
-                    threshold_value=prices.iloc[-2],
-                    metadata={"change_pct": hourly_change_pct}
+                    threshold_value=price_24h_ago,
+                    metadata={"change_pct": change_24h_pct, "timeframe": "24h"}
+                ))
+
+        # 7-day percentage change detection
+        if len(prices) >= 168:  # 7 days * 24 hours
+            price_7d_ago = prices.iloc[-168]
+            change_7d_pct = ((current_price - price_7d_ago) / price_7d_ago) * 100
+
+            if abs(change_7d_pct) > self.config.price_change_threshold_7d_pct:
+                severity = AlertSeverity.CRITICAL if abs(change_7d_pct) > 25 else AlertSeverity.HIGH
+                anomaly_type = AnomalyType.PRICE_SPIKE if change_7d_pct > 0 else AnomalyType.PRICE_DROP
+
+                anomalies.append(AnomalyEvent(
+                    timestamp=datetime.now(),
+                    anomaly_type=anomaly_type,
+                    severity=severity,
+                    description=f"Bitcoin {'surged' if change_7d_pct > 0 else 'dropped'} "
+                               f"{abs(change_7d_pct):.2f}% in the last 7 days",
+                    current_value=current_price,
+                    threshold_value=price_7d_ago,
+                    metadata={"change_pct": change_7d_pct, "timeframe": "7d"}
                 ))
 
         # Bollinger Band breakout
@@ -365,38 +391,63 @@ class AnomalyDetector:
         return anomalies
 
     def detect_volume_anomalies(self, df: pd.DataFrame) -> List[AnomalyEvent]:
-        """Detect volume-related anomalies."""
+        """Detect volume-related anomalies for both 24h and 7d timeframes."""
         anomalies = []
 
         if df.empty or 'volume' not in df.columns:
             return anomalies
 
         volumes = df['volume']
-        current_volume = volumes.iloc[-1]
-        avg_volume = volumes[:-1].mean()
 
-        # Volume spike detection
-        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        # 24-hour volume analysis
+        if len(volumes) >= 24:
+            volume_24h = volumes.tail(24).sum()
+            avg_volume_24h = volumes[:-24].rolling(24).sum().mean() if len(volumes) > 48 else volumes.mean() * 24
 
-        if volume_ratio > self.config.volume_spike_multiplier:
-            z_score = self.calculate_z_score(volumes[:-1], current_volume)
-            severity = AlertSeverity.HIGH if volume_ratio > 5 else AlertSeverity.MEDIUM
+            volume_ratio_24h = volume_24h / avg_volume_24h if avg_volume_24h > 0 else 0
 
-            anomalies.append(AnomalyEvent(
-                timestamp=datetime.now(),
-                anomaly_type=AnomalyType.VOLUME_SURGE,
-                severity=severity,
-                description=f"Trading volume is {volume_ratio:.1f}x higher than average",
-                current_value=current_volume,
-                threshold_value=avg_volume,
-                z_score=z_score,
-                metadata={"volume_ratio": volume_ratio, "avg_volume": avg_volume}
-            ))
+            if volume_ratio_24h > self.config.volume_spike_multiplier_24h:
+                severity = AlertSeverity.HIGH if volume_ratio_24h > 5 else AlertSeverity.MEDIUM
+
+                anomalies.append(AnomalyEvent(
+                    timestamp=datetime.now(),
+                    anomaly_type=AnomalyType.VOLUME_SURGE,
+                    severity=severity,
+                    description=f"24h trading volume is {volume_ratio_24h:.1f}x higher than average",
+                    current_value=volume_24h,
+                    threshold_value=avg_volume_24h,
+                    metadata={"volume_ratio": volume_ratio_24h, "avg_volume": avg_volume_24h, "timeframe": "24h"}
+                ))
+
+        # 7-day volume analysis
+        if len(volumes) >= 168:  # 7 days * 24 hours
+            volume_7d = volumes.tail(168).sum()
+            # Compare to previous 7-day periods if we have enough data
+            if len(volumes) > 336:  # Need at least 2 weeks of data
+                prev_volumes = volumes[:-168]
+                avg_volume_7d = prev_volumes.rolling(168).sum().mean()
+            else:
+                avg_volume_7d = volumes.mean() * 168
+
+            volume_ratio_7d = volume_7d / avg_volume_7d if avg_volume_7d > 0 else 0
+
+            if volume_ratio_7d > self.config.volume_spike_multiplier_7d:
+                severity = AlertSeverity.HIGH if volume_ratio_7d > 3 else AlertSeverity.MEDIUM
+
+                anomalies.append(AnomalyEvent(
+                    timestamp=datetime.now(),
+                    anomaly_type=AnomalyType.VOLUME_SURGE,
+                    severity=severity,
+                    description=f"7-day trading volume is {volume_ratio_7d:.1f}x higher than average",
+                    current_value=volume_7d,
+                    threshold_value=avg_volume_7d,
+                    metadata={"volume_ratio": volume_ratio_7d, "avg_volume": avg_volume_7d, "timeframe": "7d"}
+                ))
 
         return anomalies
 
     def detect_volatility_anomalies(self, df: pd.DataFrame) -> List[AnomalyEvent]:
-        """Detect volatility-related anomalies."""
+        """Detect volatility-related anomalies for both 24h and 7d timeframes."""
         anomalies = []
 
         if df.empty or 'close' not in df.columns or len(df) < 20:
@@ -404,30 +455,58 @@ class AnomalyDetector:
 
         # Calculate rolling volatility (standard deviation of returns)
         returns = df['close'].pct_change().dropna()
-        rolling_vol = returns.rolling(window=20).std()
 
-        if len(rolling_vol) < 2:
-            return anomalies
+        # 24-hour volatility analysis (using 24-hour rolling window)
+        if len(returns) >= 24:
+            rolling_vol_24h = returns.rolling(window=24).std()
 
-        current_vol = rolling_vol.iloc[-1]
-        historical_vol = rolling_vol[:-1]
+            if len(rolling_vol_24h) >= 2:
+                current_vol_24h = rolling_vol_24h.iloc[-1]
+                historical_vol_24h = rolling_vol_24h[:-1].dropna()
 
-        z_score = self.calculate_z_score(historical_vol.dropna(), current_vol)
+                if len(historical_vol_24h) > 0:
+                    z_score_24h = self.calculate_z_score(historical_vol_24h, current_vol_24h)
 
-        if abs(z_score) > self.config.volatility_zscore_threshold:
-            severity = AlertSeverity.HIGH if abs(z_score) > 3.5 else AlertSeverity.MEDIUM
+                    if abs(z_score_24h) > self.config.volatility_zscore_threshold:
+                        severity = AlertSeverity.HIGH if abs(z_score_24h) > 3.5 else AlertSeverity.MEDIUM
 
-            anomalies.append(AnomalyEvent(
-                timestamp=datetime.now(),
-                anomaly_type=AnomalyType.VOLATILITY_SPIKE,
-                severity=severity,
-                description=f"Bitcoin volatility is {abs(z_score):.2f} standard deviations "
-                           f"{'above' if z_score > 0 else 'below'} normal",
-                current_value=current_vol,
-                threshold_value=historical_vol.mean(),
-                z_score=z_score,
-                metadata={"current_volatility": current_vol, "avg_volatility": historical_vol.mean()}
-            ))
+                        anomalies.append(AnomalyEvent(
+                            timestamp=datetime.now(),
+                            anomaly_type=AnomalyType.VOLATILITY_SPIKE,
+                            severity=severity,
+                            description=f"24h Bitcoin volatility is {abs(z_score_24h):.2f} standard deviations "
+                                       f"{'above' if z_score_24h > 0 else 'below'} normal",
+                            current_value=current_vol_24h,
+                            threshold_value=historical_vol_24h.mean(),
+                            z_score=z_score_24h,
+                            metadata={"current_volatility": current_vol_24h, "avg_volatility": historical_vol_24h.mean(), "timeframe": "24h"}
+                        ))
+
+        # 7-day volatility analysis (using 168-hour rolling window)
+        if len(returns) >= 168:
+            rolling_vol_7d = returns.rolling(window=168).std()
+
+            if len(rolling_vol_7d) >= 2:
+                current_vol_7d = rolling_vol_7d.iloc[-1]
+                historical_vol_7d = rolling_vol_7d[:-1].dropna()
+
+                if len(historical_vol_7d) > 0:
+                    z_score_7d = self.calculate_z_score(historical_vol_7d, current_vol_7d)
+
+                    if abs(z_score_7d) > self.config.volatility_zscore_threshold_7d:
+                        severity = AlertSeverity.HIGH if abs(z_score_7d) > 3.0 else AlertSeverity.MEDIUM
+
+                        anomalies.append(AnomalyEvent(
+                            timestamp=datetime.now(),
+                            anomaly_type=AnomalyType.VOLATILITY_SPIKE,
+                            severity=severity,
+                            description=f"7-day Bitcoin volatility is {abs(z_score_7d):.2f} standard deviations "
+                                       f"{'above' if z_score_7d > 0 else 'below'} normal",
+                            current_value=current_vol_7d,
+                            threshold_value=historical_vol_7d.mean(),
+                            z_score=z_score_7d,
+                            metadata={"current_volatility": current_vol_7d, "avg_volatility": historical_vol_7d.mean(), "timeframe": "7d"}
+                        ))
 
         return anomalies
 
@@ -633,8 +712,8 @@ Threshold:       {anomaly.threshold_value:,.2f}
             self._send_discord_anomaly(anomaly)
 
     def get_market_summary(self) -> Dict[str, Any]:
-        """Get current market summary."""
-        df = self.data_fetcher.get_price_data(period="7d", interval="1h")
+        """Get current market summary with both 24h and 7d stats."""
+        df = self.data_fetcher.get_price_data(period="30d", interval="1h")
         current_price = self.data_fetcher.get_current_price()
         fear_greed = self.data_fetcher.get_fear_greed_index()
         network_stats = self.data_fetcher.get_network_stats()
@@ -647,22 +726,34 @@ Threshold:       {anomaly.threshold_value:,.2f}
         }
 
         if not df.empty:
-            summary.update({
-                "price_24h_high": df['high'].tail(24).max(),
-                "price_24h_low": df['low'].tail(24).min(),
-                "volume_24h": df['volume'].tail(24).sum(),
-                "price_change_24h_pct": ((df['close'].iloc[-1] - df['close'].iloc[-24])
-                                         / df['close'].iloc[-24] * 100) if len(df) >= 24 else 0,
-            })
+            # 24-hour stats
+            if len(df) >= 24:
+                summary.update({
+                    "price_24h_high": df['high'].tail(24).max(),
+                    "price_24h_low": df['low'].tail(24).min(),
+                    "volume_24h": df['volume'].tail(24).sum(),
+                    "price_change_24h_pct": ((df['close'].iloc[-1] - df['close'].iloc[-24])
+                                             / df['close'].iloc[-24] * 100),
+                })
+
+            # 7-day stats
+            if len(df) >= 168:  # 7 days * 24 hours
+                summary.update({
+                    "price_7d_high": df['high'].tail(168).max(),
+                    "price_7d_low": df['low'].tail(168).min(),
+                    "volume_7d": df['volume'].tail(168).sum(),
+                    "price_change_7d_pct": ((df['close'].iloc[-1] - df['close'].iloc[-168])
+                                            / df['close'].iloc[-168] * 100),
+                })
 
         return summary
 
     def check_once(self) -> List[AnomalyEvent]:
         """Run a single check for anomalies."""
-        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking for anomalies...")
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking for anomalies (24h & 7d)...")
 
-        # Fetch data
-        df = self.data_fetcher.get_price_data(period="7d", interval="1h")
+        # Fetch data - use 30d to have enough historical data for 7d comparisons
+        df = self.data_fetcher.get_price_data(period="30d", interval="1h")
         whale_txs = self.data_fetcher.get_whale_transactions()
 
         # Detect anomalies
@@ -685,11 +776,17 @@ Threshold:       {anomaly.threshold_value:,.2f}
 {'='*60}
 BITCOIN ANOMALY TRACKING BOT STARTED
 {'='*60}
-Symbol:           {self.config.symbol}
-Update Interval:  {self.config.update_interval_seconds} seconds
-Price Z-Score:    {self.config.price_zscore_threshold}
-Volume Spike:     {self.config.volume_spike_multiplier}x
-Whale Threshold:  {self.config.whale_threshold_btc} BTC
+Symbol:              {self.config.symbol}
+Update Interval:     {self.config.update_interval_seconds} seconds
+Price Z-Score:       {self.config.price_zscore_threshold}
+Whale Threshold:     {self.config.whale_threshold_btc} BTC
+--- 24-Hour Thresholds ---
+Price Change (24h):  {self.config.price_change_threshold_24h_pct}%
+Volume Spike (24h):  {self.config.volume_spike_multiplier_24h}x
+--- 7-Day Thresholds ---
+Price Change (7d):   {self.config.price_change_threshold_7d_pct}%
+Volume Spike (7d):   {self.config.volume_spike_multiplier_7d}x
+Volatility Z (7d):   {self.config.volatility_zscore_threshold_7d}
 {'='*60}
 Press Ctrl+C to stop
 """)
@@ -717,8 +814,13 @@ def load_config_from_env() -> BotConfig:
         update_interval_seconds=int(os.getenv("BTC_UPDATE_INTERVAL", "300")),
         price_zscore_threshold=float(os.getenv("BTC_PRICE_ZSCORE", "2.5")),
         volume_zscore_threshold=float(os.getenv("BTC_VOLUME_ZSCORE", "3.0")),
-        price_change_threshold_pct=float(os.getenv("BTC_PRICE_CHANGE_PCT", "5.0")),
-        volume_spike_multiplier=float(os.getenv("BTC_VOLUME_SPIKE", "3.0")),
+        # 24-hour thresholds
+        price_change_threshold_24h_pct=float(os.getenv("BTC_PRICE_CHANGE_24H_PCT", "5.0")),
+        volume_spike_multiplier_24h=float(os.getenv("BTC_VOLUME_SPIKE_24H", "3.0")),
+        # 7-day thresholds
+        price_change_threshold_7d_pct=float(os.getenv("BTC_PRICE_CHANGE_7D_PCT", "15.0")),
+        volume_spike_multiplier_7d=float(os.getenv("BTC_VOLUME_SPIKE_7D", "2.0")),
+        volatility_zscore_threshold_7d=float(os.getenv("BTC_VOLATILITY_ZSCORE_7D", "2.0")),
         whale_threshold_btc=float(os.getenv("BTC_WHALE_THRESHOLD", "100.0")),
         enable_email=os.getenv("ALERT_EMAIL_ENABLED", "").lower() == "true",
         enable_discord=os.getenv("ALERT_DISCORD_ENABLED", "").lower() == "true",
