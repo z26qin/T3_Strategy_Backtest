@@ -115,9 +115,61 @@ class BotConfig:
     enable_discord: bool = False
     enable_console: bool = True
 
+    # Multi-timeframe RSI
+    rsi_periods: List[int] = field(default_factory=lambda: [6, 14, 24])
+
+    # Daily moving average periods
+    ma_periods: List[int] = field(default_factory=lambda: [20, 50, 100, 200])
+
+    # Fear & Greed history lookback
+    fng_history_days: int = 30
+
     # Rate limiting
     max_alerts_per_hour: int = 10
     cooldown_minutes: int = 15  # Min time between same alert type
+
+
+@dataclass
+class MultiTimeframeAnalysis:
+    """Stores results of multi-timeframe oversold/overbought analysis."""
+    timestamp: datetime = field(default_factory=datetime.now)
+    current_price: Optional[float] = None
+
+    # RSI results per timeframe (list of dicts with period, value, interpretation, score)
+    hourly_rsi: List[Dict[str, Any]] = field(default_factory=list)
+    daily_rsi: List[Dict[str, Any]] = field(default_factory=list)
+    weekly_rsi: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Bollinger Band %B per timeframe
+    hourly_bb_pct: Optional[float] = None
+    daily_bb_pct: Optional[float] = None
+    weekly_bb_pct: Optional[float] = None
+
+    # Moving average analysis (daily timeframe)
+    ma_analysis: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Fear & Greed history
+    fng_current: Optional[Dict] = None
+    fng_history: List[Dict] = field(default_factory=list)
+
+    # Composite score & verdict
+    composite: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "current_price": self.current_price,
+            "hourly_rsi": self.hourly_rsi,
+            "daily_rsi": self.daily_rsi,
+            "weekly_rsi": self.weekly_rsi,
+            "hourly_bb_pct": self.hourly_bb_pct,
+            "daily_bb_pct": self.daily_bb_pct,
+            "weekly_bb_pct": self.weekly_bb_pct,
+            "ma_analysis": self.ma_analysis,
+            "fng_current": self.fng_current,
+            "fng_history_len": len(self.fng_history),
+            "composite": self.composite,
+        }
 
 
 class BitcoinDataFetcher:
@@ -235,6 +287,35 @@ class BitcoinDataFetcher:
             print(f"Error fetching network stats: {e}")
 
         return stats
+
+    def get_daily_data(self, period: str = "2y") -> pd.DataFrame:
+        """Fetch daily Bitcoin candles via yfinance."""
+        return self.get_price_data(period=period, interval="1d")
+
+    def get_weekly_data(self, period: str = "5y") -> pd.DataFrame:
+        """Fetch weekly Bitcoin candles via yfinance."""
+        return self.get_price_data(period=period, interval="1wk")
+
+    def get_fear_greed_history(self, days: int = 30) -> List[Dict]:
+        """Fetch historical Fear & Greed Index data from alternative.me API."""
+        try:
+            url = f"https://api.alternative.me/fng/?limit={days}"
+            response = requests.get(url, timeout=10)
+
+            if response.status_code == 200:
+                data = response.json()
+                history = []
+                for entry in data.get("data", []):
+                    history.append({
+                        "value": int(entry.get("value", 50)),
+                        "classification": entry.get("value_classification", "Neutral"),
+                        "timestamp": datetime.fromtimestamp(int(entry.get("timestamp", 0)))
+                    })
+                return history
+        except Exception as e:
+            print(f"Error fetching Fear & Greed history: {e}")
+
+        return []
 
     def get_fear_greed_index(self) -> Optional[Dict]:
         """Fetch the Crypto Fear & Greed Index."""
@@ -542,6 +623,193 @@ class AnomalyDetector:
 
         return anomalies
 
+    # --- Multi-timeframe analysis helpers ---
+
+    @staticmethod
+    def interpret_rsi(value: float) -> str:
+        """Interpret an RSI value as a human-readable label."""
+        if value <= 20:
+            return "Extremely Oversold"
+        elif value <= 30:
+            return "Oversold"
+        elif value <= 40:
+            return "Mildly Oversold"
+        elif value <= 60:
+            return "Neutral"
+        elif value <= 70:
+            return "Mildly Overbought"
+        elif value <= 80:
+            return "Overbought"
+        else:
+            return "Extremely Overbought"
+
+    @staticmethod
+    def score_rsi(value: float) -> float:
+        """Score RSI on a scale of -1 (most oversold) to +1 (most overbought)."""
+        # Map 0-100 RSI to -1..+1, with 50 = 0
+        return (value - 50.0) / 50.0
+
+    @staticmethod
+    def score_bollinger(bb_pct: float) -> float:
+        """Score Bollinger Band %B on -1 to +1 scale.
+
+        bb_pct is (price - lower) / (upper - lower).
+        0 = at lower band, 1 = at upper band.
+        """
+        return (bb_pct - 0.5) * 2.0
+
+    @staticmethod
+    def score_fng(value: int) -> float:
+        """Score Fear & Greed index on -1 (extreme fear) to +1 (extreme greed)."""
+        return (value - 50.0) / 50.0
+
+    @staticmethod
+    def score_ma_distance(pct: float) -> float:
+        """Score price-vs-MA distance percentage on -1 to +1.
+
+        pct is ((price - MA) / MA) * 100.  Clipped to [-30, 30].
+        """
+        clamped = max(-30.0, min(30.0, pct))
+        return clamped / 30.0
+
+    def calculate_rsi_series(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """Return the full RSI series (not just last value)."""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    def analyze_multi_rsi(self, prices: pd.Series, periods: List[int],
+                          label: str = "") -> List[Dict[str, Any]]:
+        """Compute RSI for multiple periods with interpretation.
+
+        Returns a list of dicts: {period, value, interpretation, score}.
+        """
+        results = []
+        for period in periods:
+            if len(prices) < period + 1:
+                continue
+            rsi_val = self.calculate_rsi_series(prices, period).iloc[-1]
+            if np.isnan(rsi_val):
+                continue
+            results.append({
+                "timeframe": label,
+                "period": period,
+                "value": round(rsi_val, 2),
+                "interpretation": self.interpret_rsi(rsi_val),
+                "score": round(self.score_rsi(rsi_val), 3),
+            })
+        return results
+
+    def analyze_moving_averages(self, prices: pd.Series, current_price: float,
+                                periods: List[int]) -> List[Dict[str, Any]]:
+        """Analyze price relative to multiple moving averages.
+
+        Returns a list of dicts: {period, ma_value, distance_pct, above, score}.
+        """
+        results = []
+        for period in periods:
+            if len(prices) < period:
+                continue
+            ma_val = prices.rolling(window=period).mean().iloc[-1]
+            if np.isnan(ma_val):
+                continue
+            distance_pct = ((current_price - ma_val) / ma_val) * 100
+            results.append({
+                "period": period,
+                "ma_value": round(ma_val, 2),
+                "distance_pct": round(distance_pct, 2),
+                "above": current_price >= ma_val,
+                "score": round(self.score_ma_distance(distance_pct), 3),
+            })
+        return results
+
+    def calculate_composite_score(
+        self,
+        rsi_results: List[Dict[str, Any]],
+        bb_pct: Optional[float],
+        fng_value: Optional[int],
+        ma_results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Weighted composite score combining all timeframe signals.
+
+        Weights:
+            RSI signals:  40%  (averaged across all timeframe/period combos)
+            Bollinger %B: 15%
+            Fear & Greed: 15%
+            MA distances: 30%  (averaged across periods)
+
+        Returns dict with component scores, weighted total (-1..+1), and verdict.
+        """
+        components: Dict[str, float] = {}
+        weights: Dict[str, float] = {}
+
+        # RSI average
+        if rsi_results:
+            rsi_avg = np.mean([r["score"] for r in rsi_results])
+            components["rsi"] = round(float(rsi_avg), 3)
+            weights["rsi"] = 0.40
+        else:
+            weights["rsi"] = 0.0
+
+        # Bollinger
+        if bb_pct is not None and not np.isnan(bb_pct):
+            components["bollinger"] = round(self.score_bollinger(bb_pct), 3)
+            weights["bollinger"] = 0.15
+        else:
+            weights["bollinger"] = 0.0
+
+        # Fear & Greed
+        if fng_value is not None:
+            components["fng"] = round(self.score_fng(fng_value), 3)
+            weights["fng"] = 0.15
+        else:
+            weights["fng"] = 0.0
+
+        # MA distances
+        if ma_results:
+            ma_avg = np.mean([r["score"] for r in ma_results])
+            components["ma"] = round(float(ma_avg), 3)
+            weights["ma"] = 0.30
+        else:
+            weights["ma"] = 0.0
+
+        # Normalise weights so they sum to 1
+        total_weight = sum(weights.values())
+        if total_weight == 0:
+            return {"components": components, "composite": 0.0, "verdict": "Insufficient data"}
+
+        composite = sum(
+            components.get(k, 0.0) * (weights[k] / total_weight)
+            for k in weights
+        )
+        composite = round(float(composite), 3)
+
+        # Map composite to verdict
+        if composite <= -0.6:
+            verdict = "Strongly Oversold — High-conviction buy zone"
+        elif composite <= -0.3:
+            verdict = "Oversold — Potential accumulation zone"
+        elif composite <= -0.1:
+            verdict = "Mildly Oversold — Leaning bullish"
+        elif composite <= 0.1:
+            verdict = "Neutral — No clear directional bias"
+        elif composite <= 0.3:
+            verdict = "Mildly Overbought — Leaning bearish"
+        elif composite <= 0.6:
+            verdict = "Overbought — Consider taking profits"
+        else:
+            verdict = "Strongly Overbought — High-conviction sell zone"
+
+        return {
+            "components": components,
+            "weights": {k: round(v / total_weight, 2) for k, v in weights.items()},
+            "composite": composite,
+            "verdict": verdict,
+        }
+
     def detect_whale_activity(self, transactions: List[Dict]) -> List[AnomalyEvent]:
         """Detect whale transaction anomalies."""
         anomalies = []
@@ -747,6 +1015,178 @@ Threshold:       {anomaly.threshold_value:,.2f}
                 })
 
         return summary
+
+    # --- Multi-timeframe analysis ---
+
+    def _calc_bb_pct(self, prices: pd.Series) -> Optional[float]:
+        """Calculate Bollinger Band %B for the latest price."""
+        period = self.config.bollinger_period
+        if len(prices) < period:
+            return None
+        lower, middle, upper = self.detector.calculate_bollinger_bands(prices)
+        if upper == lower:
+            return None
+        return (prices.iloc[-1] - lower) / (upper - lower)
+
+    def run_full_analysis(self) -> MultiTimeframeAnalysis:
+        """Run multi-timeframe oversold/overbought analysis.
+
+        Fetches hourly, daily, and weekly data, computes RSI across multiple
+        periods for each timeframe, Bollinger Band positions, moving-average
+        distances, and the Fear & Greed history.  Combines everything into a
+        single composite score with a human-readable verdict.
+        """
+        analysis = MultiTimeframeAnalysis(timestamp=datetime.now())
+
+        # --- Fetch data ---
+        hourly_df = self.data_fetcher.get_price_data(period="30d", interval="1h")
+        daily_df = self.data_fetcher.get_daily_data(period="2y")
+        weekly_df = self.data_fetcher.get_weekly_data(period="5y")
+
+        # Current price
+        if not hourly_df.empty:
+            analysis.current_price = hourly_df['close'].iloc[-1]
+        else:
+            analysis.current_price = self.data_fetcher.get_current_price()
+
+        # --- RSI across timeframes ---
+        rsi_periods = self.config.rsi_periods
+
+        if not hourly_df.empty:
+            analysis.hourly_rsi = self.detector.analyze_multi_rsi(
+                hourly_df['close'], rsi_periods, label="Hourly")
+
+        if not daily_df.empty:
+            analysis.daily_rsi = self.detector.analyze_multi_rsi(
+                daily_df['close'], rsi_periods, label="Daily")
+
+        if not weekly_df.empty:
+            analysis.weekly_rsi = self.detector.analyze_multi_rsi(
+                weekly_df['close'], rsi_periods, label="Weekly")
+
+        # --- Bollinger Band %B ---
+        if not hourly_df.empty:
+            analysis.hourly_bb_pct = self._calc_bb_pct(hourly_df['close'])
+        if not daily_df.empty:
+            analysis.daily_bb_pct = self._calc_bb_pct(daily_df['close'])
+        if not weekly_df.empty:
+            analysis.weekly_bb_pct = self._calc_bb_pct(weekly_df['close'])
+
+        # --- Moving average analysis (daily) ---
+        if not daily_df.empty and analysis.current_price:
+            analysis.ma_analysis = self.detector.analyze_moving_averages(
+                daily_df['close'], analysis.current_price, self.config.ma_periods)
+
+        # --- Fear & Greed ---
+        analysis.fng_current = self.data_fetcher.get_fear_greed_index()
+        analysis.fng_history = self.data_fetcher.get_fear_greed_history(
+            days=self.config.fng_history_days)
+
+        # --- Composite score ---
+        all_rsi = analysis.hourly_rsi + analysis.daily_rsi + analysis.weekly_rsi
+
+        # Use daily BB %B as primary (most reliable timeframe for BB)
+        bb_pct_for_score = analysis.daily_bb_pct
+
+        fng_val = analysis.fng_current["value"] if analysis.fng_current else None
+
+        analysis.composite = self.detector.calculate_composite_score(
+            rsi_results=all_rsi,
+            bb_pct=bb_pct_for_score,
+            fng_value=fng_val,
+            ma_results=analysis.ma_analysis,
+        )
+
+        # Print report
+        self.format_analysis_report(analysis)
+
+        return analysis
+
+    def format_analysis_report(self, analysis: MultiTimeframeAnalysis) -> None:
+        """Print a formatted multi-timeframe analysis report to console."""
+        W = 60
+        print(f"\n{'='*W}")
+        print("MULTI-TIMEFRAME OVERSOLD / OVERBOUGHT ANALYSIS")
+        print(f"{'='*W}")
+        print(f"Time:  {analysis.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        if analysis.current_price:
+            print(f"Price: ${analysis.current_price:,.2f}")
+        print(f"{'='*W}")
+
+        # --- RSI Dashboard ---
+        print(f"\n{'─'*W}")
+        print("RSI DASHBOARD")
+        print(f"{'─'*W}")
+        header = f"{'Timeframe':<10} {'Period':<8} {'RSI':<8} {'Signal':<22} {'Score':<8}"
+        print(header)
+        print(f"{'─'*W}")
+        for row in analysis.hourly_rsi + analysis.daily_rsi + analysis.weekly_rsi:
+            print(f"{row['timeframe']:<10} {row['period']:<8} "
+                  f"{row['value']:<8.2f} {row['interpretation']:<22} {row['score']:<+8.3f}")
+
+        # --- Bollinger Band positions ---
+        print(f"\n{'─'*W}")
+        print("BOLLINGER BAND POSITION (%B)")
+        print(f"{'─'*W}")
+        for label, bb in [("Hourly", analysis.hourly_bb_pct),
+                          ("Daily", analysis.daily_bb_pct),
+                          ("Weekly", analysis.weekly_bb_pct)]:
+            if bb is not None:
+                bar_len = int(max(0, min(1, bb)) * 30)
+                bar = "#" * bar_len + "." * (30 - bar_len)
+                pos = "Above mid" if bb > 0.5 else "Below mid"
+                print(f"  {label:<8} [{bar}] {bb:.2%}  ({pos})")
+            else:
+                print(f"  {label:<8} N/A")
+
+        # --- Moving Averages ---
+        if analysis.ma_analysis:
+            print(f"\n{'─'*W}")
+            print("MOVING AVERAGE ANALYSIS (Daily)")
+            print(f"{'─'*W}")
+            print(f"{'MA':<8} {'Value':<14} {'Distance':<10} {'Position':<8} {'Score':<8}")
+            print(f"{'─'*W}")
+            for ma in analysis.ma_analysis:
+                pos = "ABOVE" if ma["above"] else "BELOW"
+                print(f"MA-{ma['period']:<4} ${ma['ma_value']:<13,.2f} "
+                      f"{ma['distance_pct']:>+8.2f}%  {pos:<8} {ma['score']:<+8.3f}")
+
+        # --- Fear & Greed ---
+        print(f"\n{'─'*W}")
+        print("FEAR & GREED INDEX")
+        print(f"{'─'*W}")
+        if analysis.fng_current:
+            val = analysis.fng_current["value"]
+            cls = analysis.fng_current["classification"]
+            bar_len = int(val * 30 / 100)
+            bar = "#" * bar_len + "." * (30 - bar_len)
+            print(f"  Current: [{bar}] {val}/100 — {cls}")
+        else:
+            print("  Current: N/A")
+
+        if analysis.fng_history:
+            values = [h["value"] for h in analysis.fng_history]
+            print(f"  {len(values)}-day avg: {np.mean(values):.1f}  "
+                  f"min: {min(values)}  max: {max(values)}")
+
+        # --- Composite Score ---
+        if analysis.composite:
+            print(f"\n{'='*W}")
+            print("COMPOSITE SCORE")
+            print(f"{'='*W}")
+            comp = analysis.composite
+            for k, v in comp.get("components", {}).items():
+                w = comp.get("weights", {}).get(k, 0)
+                print(f"  {k.upper():<12} score={v:>+7.3f}  weight={w:.0%}")
+            score = comp["composite"]
+            # Visual bar: map -1..+1 to 0..30
+            bar_pos = int((score + 1) / 2 * 30)
+            bar_pos = max(0, min(30, bar_pos))
+            bar = "." * bar_pos + "|" + "." * (30 - bar_pos)
+            print(f"\n  Oversold [{bar}] Overbought")
+            print(f"  Composite: {score:+.3f}")
+            print(f"\n  >> {comp['verdict']} <<")
+            print(f"{'='*W}\n")
 
     def check_once(self) -> List[AnomalyEvent]:
         """Run a single check for anomalies."""

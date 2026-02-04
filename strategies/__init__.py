@@ -6,6 +6,7 @@ from .liquidity_analysis import LiquidityAnalysis
 from .alerts import AlertManager, AlertConfig, load_config_from_env
 from .position_sizing import PositionSizer, PositionSizingParams, SizingMethod, AdvancedBacktester
 from .optimizer import StrategyOptimizer, OptimizationParams
+from .bitcoin_anomaly_bot import BitcoinAnomalyBot, BotConfig, MultiTimeframeAnalysis
 
 __all__ = [
     'TQQQMA200Strategy',
@@ -21,4 +22,7 @@ __all__ = [
     'AdvancedBacktester',
     'StrategyOptimizer',
     'OptimizationParams',
+    'BitcoinAnomalyBot',
+    'BotConfig',
+    'MultiTimeframeAnalysis',
 ]
