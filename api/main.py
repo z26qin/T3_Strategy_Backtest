@@ -6,6 +6,9 @@ Endpoints:
     GET  /backtest/run      — Run backtest with custom parameters
     GET  /backtest/trades   — List all round-trip trade records
     POST /alert/subscribe   — Subscribe to signal alerts
+    GET  /features/history  — Query feature history from Parquet store
+    GET  /features/scorecard — Signal accuracy report
+    GET  /experiments       — Backtest experiment log
     GET  /health            — Health check
 
 Run with:
@@ -27,9 +30,19 @@ from api.models import (
     AlertSubscription,
     AlertSubscriptionResponse,
     HealthResponse,
+    FeatureRow,
+    FeatureHistoryResponse,
+    ScorecardResponse,
+    SignalScoreItem,
+    SignalTypeSummary,
+    ExperimentRecord,
+    ExperimentListResponse,
 )
 from strategies.signal_engine import SignalEngine
 from strategies.backtest_runner import run_backtest, get_trades
+from strategies.feature_store import FeatureStore
+from strategies.signal_scorecard import SignalScorecard
+from strategies.experiment_log import ExperimentLog
 
 
 # =====================================================
@@ -55,6 +68,10 @@ _signal_engine = SignalEngine(cache_ttl=900)
 
 # In-memory alert subscriptions (simple storage for now)
 _subscriptions: list[dict] = []
+
+# MLOps components (feature store + experiment log)
+_feature_store = FeatureStore()
+_experiment_log = ExperimentLog()
 
 
 # =====================================================
@@ -239,6 +256,137 @@ def subscribe_alert(
     )
 
 
+# =====================================================
+# MLOps Endpoints
+# =====================================================
+
+@app.get(
+    "/features/history",
+    response_model=FeatureHistoryResponse,
+    summary="Query feature history",
+    tags=["MLOps"],
+)
+def get_feature_history(
+    start: Optional[str] = Query(
+        default=None,
+        description="Start date inclusive (YYYY-MM-DD)",
+    ),
+    end: Optional[str] = Query(
+        default=None,
+        description="End date inclusive (YYYY-MM-DD)",
+    ),
+    columns: Optional[str] = Query(
+        default=None,
+        description="Comma-separated column names to return (e.g. 'ma200,signal'). "
+                    "Omit for all columns.",
+    ),
+    _: None = Depends(verify_api_key),
+) -> FeatureHistoryResponse:
+    """
+    Query the feature history store (Parquet-backed).
+
+    Returns daily feature snapshots recorded each time a signal is computed.
+    Supports time range filtering and column pruning for efficient queries.
+    """
+    try:
+        col_list = [c.strip() for c in columns.split(",")] if columns else None
+        df = _feature_store.read(columns=col_list, start=start, end=end)
+
+        features = [FeatureRow(**row) for row in df.to_dict("records")]
+
+        return FeatureHistoryResponse(
+            total_rows=len(features),
+            start_date=df["date"].min() if not df.empty and "date" in df.columns else None,
+            end_date=df["date"].max() if not df.empty and "date" in df.columns else None,
+            features=features,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read features: {e}")
+
+
+@app.get(
+    "/features/scorecard",
+    response_model=ScorecardResponse,
+    summary="Signal accuracy report",
+    tags=["MLOps"],
+)
+def get_signal_scorecard(
+    _: None = Depends(verify_api_key),
+) -> ScorecardResponse:
+    """
+    Evaluate historical signal accuracy using forward returns.
+
+    For each BUY/SELL signal in the feature store, computes what actually
+    happened 5, 10, and 20 trading days later. Returns per-signal scores
+    and aggregated win rates.
+
+    Note: Requires feature history data. Returns empty results if the
+    feature store is new.
+    """
+    try:
+        scorecard = SignalScorecard(feature_store=_feature_store)
+        report = scorecard.full_report()
+
+        # Convert nested dicts to Pydantic models
+        all_scores = [SignalScoreItem(**s) for s in report["all_scores"]]
+
+        buy_summary = None
+        if report["buy_summary"]:
+            buy_summary = SignalTypeSummary(**report["buy_summary"])
+
+        sell_summary = None
+        if report["sell_summary"]:
+            sell_summary = SignalTypeSummary(**report["sell_summary"])
+
+        return ScorecardResponse(
+            data_range=report["data_range"],
+            total_signals=report["total_signals"],
+            buy_summary=buy_summary,
+            sell_summary=sell_summary,
+            all_scores=all_scores,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scorecard failed: {e}")
+
+
+@app.get(
+    "/experiments",
+    response_model=ExperimentListResponse,
+    summary="Backtest experiment log",
+    tags=["MLOps"],
+)
+def get_experiments(
+    recent: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of most recent experiments to return",
+    ),
+    _: None = Depends(verify_api_key),
+) -> ExperimentListResponse:
+    """
+    List backtest experiment records (auto-logged each time /backtest/run is called).
+
+    Shows parameters used and results obtained for each run. Useful for
+    comparing different parameter combinations and tracking strategy performance.
+    """
+    try:
+        df = _experiment_log.recent(n=recent)
+        experiments = [ExperimentRecord(**row) for row in df.to_dict("records")]
+
+        # Find best Sharpe across all experiments
+        best_series = _experiment_log.best_by("sharpe_ratio")
+        best_sharpe = ExperimentRecord(**best_series.to_dict()) if best_series is not None else None
+
+        return ExperimentListResponse(
+            total_experiments=_experiment_log.count(),
+            best_sharpe=best_sharpe,
+            experiments=experiments,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read experiments: {e}")
+
+
 @app.get(
     "/health",
     response_model=HealthResponse,
@@ -267,5 +415,8 @@ def health_check() -> HealthResponse:
             "yfinance": "ok" if yfinance_ok else "unreachable",
             "cache_ttl_seconds": 900,
             "active_subscriptions": len(_subscriptions),
+            "feature_store_rows": _feature_store.count(),
+            "feature_store_latest": _feature_store.latest_date(),
+            "experiment_log_count": _experiment_log.count(),
         },
     )

@@ -35,6 +35,9 @@ T3_Strategy_Backtest/
 │   ├── signal_checker.py           # Daily signal checker
 │   ├── signal_engine.py            # Cached signal service for API
 │   ├── backtest_runner.py          # Structured backtest interface for API
+│   ├── feature_store.py            # Parquet-based feature history store
+│   ├── signal_scorecard.py         # Signal accuracy evaluation
+│   ├── experiment_log.py           # Backtest experiment tracking
 │   ├── leveraged_etf_comparison.py # Compare multiple ETFs
 │   ├── liquidity_analysis.py       # Market liquidity analysis
 │   ├── alerts.py                   # Email/Discord alerts
@@ -209,6 +212,9 @@ open http://localhost:8000/docs
 | `GET` | `/backtest/run` | Run backtest with custom parameters |
 | `GET` | `/backtest/trades` | List all round-trip trade records |
 | `POST` | `/alert/subscribe` | Subscribe to signal alerts |
+| `GET` | `/features/history` | Query feature history (Parquet-backed) |
+| `GET` | `/features/scorecard` | Signal accuracy report with forward returns |
+| `GET` | `/experiments` | Backtest experiment log |
 | `GET` | `/health` | Health check & service status |
 
 ### curl Examples
@@ -248,6 +254,25 @@ curl -X POST http://localhost:8000/alert/subscribe \
 curl http://localhost:8000/health | python -m json.tool
 ```
 
+**Query feature history (with column pruning):**
+
+```bash
+curl "http://localhost:8000/features/history?start=2025-01-01&columns=ma200,signal" \
+  | python -m json.tool
+```
+
+**Signal accuracy scorecard:**
+
+```bash
+curl http://localhost:8000/features/scorecard | python -m json.tool
+```
+
+**Backtest experiment log:**
+
+```bash
+curl "http://localhost:8000/experiments?recent=10" | python -m json.tool
+```
+
 ### API Authentication
 
 API Key authentication is optional and controlled by the `API_KEY` environment variable:
@@ -285,6 +310,73 @@ To set an API Key in Docker:
 
 ```bash
 API_KEY=your-secret-key docker-compose up --build
+```
+
+## MLOps: Feature History & Experiment Tracking
+
+The project includes a lightweight MLOps layer for recording, auditing, and evaluating strategy behavior over time. All data is stored as Parquet files in `data/` (git-ignored).
+
+### Feature Store
+
+Every time the signal engine computes a new signal, it automatically records a snapshot of all features (QQQ price, MA200, signal, strength, etc.) to `data/features/daily_features.parquet`.
+
+```python
+from strategies.feature_store import FeatureStore
+
+store = FeatureStore()
+
+# Read all history
+df = store.read()
+
+# Column pruning — only load what you need (Parquet advantage)
+df = store.read(columns=["ma200", "signal"], start="2025-01-01")
+
+print(f"Total rows: {store.count()}")
+print(f"Latest date: {store.latest_date()}")
+```
+
+### Signal Scorecard
+
+Evaluates the accuracy of historical BUY/SELL signals by checking what actually happened 5, 10, and 20 trading days after each signal.
+
+```python
+from strategies.signal_scorecard import SignalScorecard
+
+scorecard = SignalScorecard()
+report = scorecard.full_report()
+
+# Example output:
+# BUY signals: 12 total
+#   5-day avg return: +2.1%, win rate: 72%
+#   10-day avg return: +3.5%, win rate: 68%
+#   20-day avg return: +1.8%, win rate: 55%
+```
+
+### Experiment Log
+
+Every backtest run is automatically logged to `data/experiments/backtest_log.parquet` with full parameters and results.
+
+```python
+from strategies.experiment_log import ExperimentLog
+
+log = ExperimentLog()
+
+# View recent experiments
+print(log.recent(5))
+
+# Find the best parameter combination
+best = log.best_by("sharpe_ratio")
+print(f"Best Sharpe: {best['sharpe_ratio']} (start: {best['start_date']})")
+```
+
+### Storage Layout
+
+```
+data/
+├── features/
+│   └── daily_features.parquet       # Daily feature snapshots (auto-recorded)
+└── experiments/
+    └── backtest_log.parquet         # Backtest experiment log (auto-recorded)
 ```
 
 ## Strategy Parameters

@@ -7,12 +7,18 @@ Wraps the existing SignalChecker with:
 - Signal strength and human-readable trigger explanation
 """
 
+import logging
 import time
 from datetime import datetime
 from typing import Optional, Tuple
 
+import pandas as pd
+
 from strategies.signal_checker import SignalChecker, SignalStatus
+from strategies.feature_store import FeatureStore
 from api.models import SignalResponse, SignalConditions
+
+logger = logging.getLogger(__name__)
 
 
 class SignalCache:
@@ -61,13 +67,15 @@ class SignalEngine:
         response = engine.get_current_signal()  # Returns SignalResponse
     """
 
-    def __init__(self, cache_ttl: int = 900):
+    def __init__(self, cache_ttl: int = 900, feature_store: Optional[FeatureStore] = None):
         """
         Args:
             cache_ttl: Cache TTL in seconds. Default 900 = 15 minutes.
+            feature_store: Optional FeatureStore instance. Defaults to standard path.
         """
         self._cache = SignalCache(ttl_seconds=cache_ttl)
         self._checker = SignalChecker()
+        self._feature_store = feature_store or FeatureStore()
 
     def get_current_signal(self, force_refresh: bool = False) -> SignalResponse:
         """
@@ -91,6 +99,9 @@ class SignalEngine:
 
         # 3. Store in cache
         self._cache.set(status)
+
+        # 4. Persist to feature store (non-blocking: failure won't break the API)
+        self._record_features(status)
 
         return self._status_to_response(status)
 
@@ -190,3 +201,35 @@ class SignalEngine:
             )
 
         return f"HOLD — no action needed. {'; '.join(parts)}."
+
+    def _record_features(self, status: SignalStatus) -> None:
+        """
+        Persist today's features to the Parquet feature store.
+
+        Called after every fresh data fetch (cache miss). Safe to call
+        multiple times — FeatureStore.write() is idempotent by date.
+
+        Wrapped in try/except so a feature store failure never breaks the API.
+        """
+        try:
+            strength = self._calc_signal_strength(status)
+            position = "LONG TQQQ" if status.current_position == 1 else "CASH"
+
+            row = pd.DataFrame([{
+                "date": status.date,
+                "qqq_close": round(status.qqq_close, 2),
+                "ma200": round(status.ma200, 2),
+                "buy_level": round(status.buy_level, 2),
+                "sell_level": round(status.sell_level, 2),
+                "daily_return": round(status.qqq_daily_return, 6),
+                "tqqq_close": round(status.tqqq_close, 2),
+                "signal": status.signal,
+                "signal_strength": strength,
+                "current_position": position,
+            }])
+
+            written = self._feature_store.write(row)
+            if written > 0:
+                logger.info(f"Feature store: recorded {status.date} ({status.signal})")
+        except Exception as e:
+            logger.warning(f"Feature store write failed (non-fatal): {e}")

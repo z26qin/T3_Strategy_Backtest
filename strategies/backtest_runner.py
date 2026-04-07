@@ -6,12 +6,20 @@ Wraps the existing TQQQMA200Strategy with:
 - Round-trip trade pairing (BUY + SELL = one complete trade)
 - Win rate calculation
 - All results returned as Pydantic models
+- Automatic experiment logging to Parquet
 """
 
+import logging
 from typing import List, Tuple
 
 from strategies.tqqq_ma200_strategy import TQQQMA200Strategy, StrategyParams
+from strategies.experiment_log import ExperimentLog
 from api.models import BacktestResult, TradeRecord, TradeListResponse
+
+logger = logging.getLogger(__name__)
+
+# Module-level experiment log (shared across all calls)
+_experiment_log = ExperimentLog()
 
 
 def run_backtest(
@@ -50,7 +58,7 @@ def run_backtest(
     win_rate = (len(winning) / len(closed_trades) * 100) if closed_trades else 0.0
 
     # 3. Build response
-    return BacktestResult(
+    result = BacktestResult(
         start_date=params.start_date,
         end_date=params.end_date,
         initial_capital=initial_capital,
@@ -66,6 +74,11 @@ def run_backtest(
         buy_hold_return_pct=round(bh["total_return"], 2),
         buy_hold_max_drawdown_pct=round(bh["max_drawdown"], 2),
     )
+
+    # 4. Log experiment (non-blocking: failure won't break the API)
+    _log_experiment(params, result)
+
+    return result
 
 
 def get_trades(
@@ -186,3 +199,34 @@ def _parse_date(date_str: str):
     """Parse YYYY-MM-DD string to pandas Timestamp for date arithmetic."""
     import pandas as pd
     return pd.Timestamp(date_str)
+
+
+def _log_experiment(params: StrategyParams, result: BacktestResult) -> None:
+    """
+    Record backtest parameters and results to the experiment log.
+
+    Wrapped in try/except so logging failure never breaks the backtest response.
+    """
+    try:
+        _experiment_log.record(
+            params={
+                "start_date": params.start_date,
+                "end_date": params.end_date,
+                "initial_capital": params.initial_capital,
+            },
+            results={
+                "total_return_pct": result.total_return_pct,
+                "annualized_return_pct": result.annualized_return_pct,
+                "sharpe_ratio": result.sharpe_ratio,
+                "max_drawdown_pct": result.max_drawdown_pct,
+                "volatility_pct": result.volatility_pct,
+                "win_rate_pct": result.win_rate_pct,
+                "total_trades": result.total_trades,
+                "time_in_market_pct": result.time_in_market_pct,
+                "final_value": result.final_value,
+                "buy_hold_return_pct": result.buy_hold_return_pct,
+                "buy_hold_max_drawdown_pct": result.buy_hold_max_drawdown_pct,
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Experiment log write failed (non-fatal): {e}")

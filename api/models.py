@@ -106,6 +106,95 @@ class AlertSubscriptionResponse(BaseModel):
 
 
 # =====================================================
+# Feature History Models
+# =====================================================
+
+class FeatureRow(BaseModel):
+    """A single day's feature snapshot."""
+    date: str
+    qqq_close: float
+    ma200: float
+    buy_level: float
+    sell_level: float
+    daily_return: float
+    tqqq_close: float
+    signal: str
+    signal_strength: str
+    current_position: str
+    recorded_at: Optional[str] = None
+
+
+class FeatureHistoryResponse(BaseModel):
+    """Response model for GET /features/history."""
+    total_rows: int
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    features: List[FeatureRow]
+
+
+# =====================================================
+# Signal Scorecard Models
+# =====================================================
+
+class SignalScoreItem(BaseModel):
+    """Score for a single signal event."""
+    date: str
+    signal: str
+    signal_strength: str
+    tqqq_price: float
+    forward_returns_pct: dict = Field(description="e.g. {'5d': 3.2, '10d': 5.1, '20d': -1.8}")
+
+
+class SignalTypeSummary(BaseModel):
+    """Aggregated stats for one signal type (BUY or SELL)."""
+    signal_type: str
+    total_signals: int
+    avg_forward_return_pct: dict = Field(description="e.g. {'5d': 2.1, '10d': 3.5}")
+    win_rate_pct: dict = Field(description="e.g. {'5d': 72.0, '10d': 68.0}")
+    best_signal: Optional[dict] = None
+    worst_signal: Optional[dict] = None
+
+
+class ScorecardResponse(BaseModel):
+    """Response model for GET /features/scorecard."""
+    data_range: dict
+    total_signals: int
+    buy_summary: Optional[SignalTypeSummary] = None
+    sell_summary: Optional[SignalTypeSummary] = None
+    all_scores: List[SignalScoreItem]
+
+
+# =====================================================
+# Experiment Log Models
+# =====================================================
+
+class ExperimentRecord(BaseModel):
+    """A single backtest experiment record."""
+    run_timestamp: str
+    start_date: str
+    end_date: Optional[str] = None
+    initial_capital: float
+    total_return_pct: float
+    annualized_return_pct: float
+    sharpe_ratio: float
+    max_drawdown_pct: float
+    volatility_pct: Optional[float] = None
+    win_rate_pct: float
+    total_trades: int
+    time_in_market_pct: float
+    final_value: Optional[float] = None
+    buy_hold_return_pct: Optional[float] = None
+    buy_hold_max_drawdown_pct: Optional[float] = None
+
+
+class ExperimentListResponse(BaseModel):
+    """Response model for GET /experiments."""
+    total_experiments: int
+    best_sharpe: Optional[ExperimentRecord] = None
+    experiments: List[ExperimentRecord]
+
+
+# =====================================================
 # Health Check Model
 # =====================================================
 
