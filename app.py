@@ -426,6 +426,36 @@ def create_position_sizing_tab():
     ])
 
 
+def create_api_docs_tab():
+    """Create API documentation tab with embedded Swagger UI."""
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.H3("API Documentation", className="mb-3"),
+                html.P([
+                    "The FastAPI backend exposes REST endpoints for signals, backtesting, and alerts. ",
+                    "The interactive Swagger UI below lets you test API calls directly. ",
+                    html.A("Open in new tab", href="http://localhost:8000/docs", target="_blank",
+                           className="ms-2 btn btn-outline-primary btn-sm"),
+                ]),
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                html.Iframe(
+                    src="http://localhost:8000/docs",
+                    style={
+                        "width": "100%",
+                        "height": "800px",
+                        "border": "1px solid #ddd",
+                        "borderRadius": "4px",
+                    },
+                )
+            ])
+        ])
+    ])
+
+
 # Main layout
 app.layout = html.Div([
     create_navbar(),
@@ -438,6 +468,7 @@ app.layout = html.Div([
             dcc.Tab(label="Optimization", value="optimizer-tab"),
             dcc.Tab(label="ETF Comparison", value="etf-tab"),
             dcc.Tab(label="Liquidity Analysis", value="liquidity-tab"),
+            dcc.Tab(label="API Docs", value="api-docs-tab"),
         ], className="mb-4"),
         html.Div(id="tab-content")
     ], fluid=True)
@@ -466,6 +497,8 @@ def render_tab_content(tab):
         return create_etf_comparison_tab()
     elif tab == "liquidity-tab":
         return create_liquidity_tab()
+    elif tab == "api-docs-tab":
+        return create_api_docs_tab()
     return html.Div("Select a tab")
 
 
@@ -944,4 +977,6 @@ def run_position_sizing_backtest(n_clicks, method, max_pos, vol_target, kelly_fr
 if __name__ == "__main__":
     print("Starting Trading Strategy Dashboard...")
     print("Open http://127.0.0.1:8050 in your browser")
-    app.run(debug=True, host="127.0.0.1", port=8050)
+    import os
+    host = os.getenv("DASH_HOST", "127.0.0.1")
+    app.run(debug=True, host=host, port=8050)

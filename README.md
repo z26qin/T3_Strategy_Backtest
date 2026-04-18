@@ -23,12 +23,21 @@ The strategy uses QQQ (Nasdaq-100 ETF) as a signal indicator to trade TQQQ (3x l
 
 ```
 T3_Strategy_Backtest/
-├── app.py                          # Dash web dashboard
+├── app.py                          # Dash web dashboard (port 8050)
 ├── start_dashboard.command         # Double-click to launch dashboard (macOS)
+├── api/                            # FastAPI REST API layer
+│   ├── __init__.py
+│   ├── main.py                     # FastAPI app & endpoints (port 8000)
+│   └── models.py                   # Pydantic request/response models
 ├── strategies/                     # Python modules
 │   ├── __init__.py
 │   ├── tqqq_ma200_strategy.py      # Core backtesting engine
 │   ├── signal_checker.py           # Daily signal checker
+│   ├── signal_engine.py            # Cached signal service for API
+│   ├── backtest_runner.py          # Structured backtest interface for API
+│   ├── feature_store.py            # Parquet-based feature history store
+│   ├── signal_scorecard.py         # Signal accuracy evaluation
+│   ├── experiment_log.py           # Backtest experiment tracking
 │   ├── leveraged_etf_comparison.py # Compare multiple ETFs
 │   ├── liquidity_analysis.py       # Market liquidity analysis
 │   ├── alerts.py                   # Email/Discord alerts
@@ -38,6 +47,8 @@ T3_Strategy_Backtest/
 ├── tqqq_signal_checker.ipynb               # Daily signal notebook
 ├── leveraged_etf_comparison_notebook.ipynb # ETF comparison notebook
 ├── us_market_liquidity_analysis.ipynb      # Liquidity analysis notebook
+├── Dockerfile                      # Container image definition
+├── docker-compose.yml              # Multi-service orchestration
 └── README.md
 ```
 
@@ -62,13 +73,13 @@ source .venv/bin/activate  # On macOS/Linux
 ### 3. Install Dependencies
 
 ```bash
-pip install yfinance pandas numpy plotly dash dash-bootstrap-components scipy
+pip install -r requirements.txt
 ```
 
-Or install all at once:
+Or install manually:
 
 ```bash
-pip install yfinance pandas numpy plotly dash dash-bootstrap-components scipy jupyter
+pip install yfinance pandas numpy plotly dash dash-bootstrap-components scipy fastapi "uvicorn[standard]" "pydantic>=2.0"
 ```
 
 ## Usage
@@ -174,6 +185,199 @@ Monitor US market liquidity conditions.
 - Volatility metrics (VIX, realized volatility, VIX-RV spread)
 - 95% confidence intervals for all metrics
 - Liquidity regime classification (High/Normal/Low/Crisis)
+
+### 7. API Docs
+
+Embedded Swagger UI for the FastAPI backend. Test API calls directly from the dashboard or open in a new browser tab.
+
+## REST API
+
+The project includes a FastAPI backend that exposes the strategy as REST endpoints.
+
+### Quick Start
+
+```bash
+# Start the API server
+uvicorn api.main:app --reload --port 8000
+
+# Open Swagger docs in browser
+open http://localhost:8000/docs
+```
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/signal/current` | Current trading signal (BUY/SELL/HOLD) |
+| `GET` | `/backtest/run` | Run backtest with custom parameters |
+| `GET` | `/backtest/trades` | List all round-trip trade records |
+| `POST` | `/alert/subscribe` | Subscribe to signal alerts |
+| `GET` | `/features/history` | Query feature history (Parquet-backed) |
+| `GET` | `/features/scorecard` | Signal accuracy report with forward returns |
+| `GET` | `/experiments` | Backtest experiment log |
+| `GET` | `/health` | Health check & service status |
+
+### curl Examples
+
+**Get current signal:**
+
+```bash
+curl http://localhost:8000/signal/current | python -m json.tool
+```
+
+**Run backtest with custom parameters:**
+
+```bash
+curl "http://localhost:8000/backtest/run?start_date=2020-01-01&end_date=2024-12-31&initial_capital=50000" \
+  | python -m json.tool
+```
+
+**Get trade history:**
+
+```bash
+curl "http://localhost:8000/backtest/trades?start_date=2020-01-01" \
+  | python -m json.tool
+```
+
+**Subscribe to alerts:**
+
+```bash
+curl -X POST http://localhost:8000/alert/subscribe \
+  -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "signal_types": ["BUY", "SELL"]}' \
+  | python -m json.tool
+```
+
+**Health check:**
+
+```bash
+curl http://localhost:8000/health | python -m json.tool
+```
+
+**Query feature history (with column pruning):**
+
+```bash
+curl "http://localhost:8000/features/history?start=2025-01-01&columns=ma200,signal" \
+  | python -m json.tool
+```
+
+**Signal accuracy scorecard:**
+
+```bash
+curl http://localhost:8000/features/scorecard | python -m json.tool
+```
+
+**Backtest experiment log:**
+
+```bash
+curl "http://localhost:8000/experiments?recent=10" | python -m json.tool
+```
+
+### API Authentication
+
+API Key authentication is optional and controlled by the `API_KEY` environment variable:
+
+- **Not set** (default): No auth required — ideal for local development
+- **Set**: All endpoints (except `/health`) require the `X-API-Key` header
+
+```bash
+# Enable API Key auth
+export API_KEY=your-secret-key
+
+# Call with auth header
+curl -H "X-API-Key: your-secret-key" http://localhost:8000/signal/current
+```
+
+## Docker Deployment
+
+Run both the Dash dashboard and FastAPI backend with a single command:
+
+```bash
+# Build and start both services
+docker-compose up --build
+
+# Or run in background
+docker-compose up --build -d
+```
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| Dashboard | http://localhost:8050 | Dash web UI |
+| API | http://localhost:8000 | FastAPI REST API |
+| API Docs | http://localhost:8000/docs | Swagger UI |
+
+To set an API Key in Docker:
+
+```bash
+API_KEY=your-secret-key docker-compose up --build
+```
+
+## MLOps: Feature History & Experiment Tracking
+
+The project includes a lightweight MLOps layer for recording, auditing, and evaluating strategy behavior over time. All data is stored as Parquet files in `data/` (git-ignored).
+
+### Feature Store
+
+Every time the signal engine computes a new signal, it automatically records a snapshot of all features (QQQ price, MA200, signal, strength, etc.) to `data/features/daily_features.parquet`.
+
+```python
+from strategies.feature_store import FeatureStore
+
+store = FeatureStore()
+
+# Read all history
+df = store.read()
+
+# Column pruning — only load what you need (Parquet advantage)
+df = store.read(columns=["ma200", "signal"], start="2025-01-01")
+
+print(f"Total rows: {store.count()}")
+print(f"Latest date: {store.latest_date()}")
+```
+
+### Signal Scorecard
+
+Evaluates the accuracy of historical BUY/SELL signals by checking what actually happened 5, 10, and 20 trading days after each signal.
+
+```python
+from strategies.signal_scorecard import SignalScorecard
+
+scorecard = SignalScorecard()
+report = scorecard.full_report()
+
+# Example output:
+# BUY signals: 12 total
+#   5-day avg return: +2.1%, win rate: 72%
+#   10-day avg return: +3.5%, win rate: 68%
+#   20-day avg return: +1.8%, win rate: 55%
+```
+
+### Experiment Log
+
+Every backtest run is automatically logged to `data/experiments/backtest_log.parquet` with full parameters and results.
+
+```python
+from strategies.experiment_log import ExperimentLog
+
+log = ExperimentLog()
+
+# View recent experiments
+print(log.recent(5))
+
+# Find the best parameter combination
+best = log.best_by("sharpe_ratio")
+print(f"Best Sharpe: {best['sharpe_ratio']} (start: {best['start_date']})")
+```
+
+### Storage Layout
+
+```
+data/
+├── features/
+│   └── daily_features.parquet       # Daily feature snapshots (auto-recorded)
+└── experiments/
+    └── backtest_log.parquet         # Backtest experiment log (auto-recorded)
+```
 
 ## Strategy Parameters
 
